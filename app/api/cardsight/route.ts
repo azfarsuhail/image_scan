@@ -1,5 +1,11 @@
 import { connection } from "next/server";
-import { summarizePricing, toCardSight, type CsIdentify, type CsPricing } from "@/lib/cardsight";
+import {
+  CARDSIGHT_MONTHLY_LIMIT,
+  summarizePricing,
+  toCardSight,
+  type CsIdentify,
+  type CsPricing,
+} from "@/lib/cardsight";
 import { missingKey, readImage } from "@/lib/upload";
 
 const API = "https://api.cardsight.ai/v1";
@@ -26,17 +32,21 @@ async function getJson<T>(path: string, key: string): Promise<T | null> {
   }
 }
 
-// CardSight bills by monthly call count (no scan balance), so the badge shows calls used.
-async function callsThisMonth(key: string): Promise<number | null> {
+// CardSight reports calls used this month; remaining = plan cap minus that.
+async function usage(key: string) {
   const body = await getJson<{ calls?: number }>("/subscription/", key);
-  return typeof body?.calls === "number" ? body.calls : null;
+  const used = typeof body?.calls === "number" ? body.calls : null;
+  return {
+    calls_this_month: used,
+    calls_remaining: used === null ? null : Math.max(0, CARDSIGHT_MONTHLY_LIMIT - used),
+  };
 }
 
 export async function GET() {
   await connection(); // always run at request time, never prerendered at build
   const key = process.env.CARDSIGHT_API_KEY;
   if (!key) return missingKey("CARDSIGHT_API_KEY");
-  return Response.json({ calls_this_month: await callsThisMonth(key) });
+  return Response.json(await usage(key));
 }
 
 export async function POST(req: Request) {
@@ -62,9 +72,19 @@ export async function POST(req: Request) {
   }
 
   if (!res.ok) {
+    const u = await usage(key);
+    if (u.calls_remaining === 0) {
+      return Response.json(
+        {
+          error: `CardSight monthly limit reached (${CARDSIGHT_MONTHLY_LIMIT} calls). Upgrade the CardSight plan for more calls.`,
+          ...u,
+        },
+        { status: 429 },
+      );
+    }
     const known = res.status in UPSTREAM_ERRORS;
     return Response.json(
-      { error: known ? UPSTREAM_ERRORS[res.status] : `CardSight error (${res.status}).` },
+      { error: known ? UPSTREAM_ERRORS[res.status] : `CardSight error (${res.status}).`, ...u },
       { status: known ? res.status : 502 },
     );
   }
@@ -75,7 +95,7 @@ export async function POST(req: Request) {
   const result = toCardSight(body);
   if (typeof result === "string") {
     return Response.json(
-      { error: result, calls_this_month: await callsThisMonth(key), raw: body },
+      { error: result, ...(await usage(key)), raw: body },
       { status: 422 },
     );
   }
@@ -91,7 +111,7 @@ export async function POST(req: Request) {
 
   return Response.json({
     result: { ...result, pricing: pricing && summarizePricing(pricing) },
-    calls_this_month: await callsThisMonth(key),
+    ...(await usage(key)),
     raw: { ...body, pricing }, // full payloads for the "full response" panel
   });
 }

@@ -1,5 +1,8 @@
 type Tier = "High" | "Medium" | "Low";
 
+// Current CardSight plan: usage is hard-capped at 750 calls/month. Change this if the plan changes.
+export const CARDSIGHT_MONTHLY_LIMIT = 750;
+
 // Real CardSight shapes (https://api.cardsight.ai/documentation/json) — only the fields we use.
 export type CsIdentify = {
   success: boolean;
@@ -50,6 +53,7 @@ export type CardSightResponse = {
   result?: CardSightResult;
   error?: string;
   calls_this_month?: number | null;
+  calls_remaining?: number | null;
   raw?: Record<string, unknown>; // complete identify (+ pricing) payload, shown untruncated in the UI
 };
 

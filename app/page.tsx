@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import type { CardSightResponse, CardSightResult } from "@/lib/cardsight";
+import { CARDSIGHT_MONTHLY_LIMIT, type CardSightResponse, type CardSightResult } from "@/lib/cardsight";
 import type { ApiResponse, CardResult } from "@/lib/tcgapi";
 
 const usd = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" });
@@ -11,6 +11,16 @@ type Raw = Record<string, unknown>;
 type Panel<T> = { loading: boolean; result: T | null; error: string | null; raw: Raw | null; ms: number | null };
 const IDLE: Panel<never> = { loading: false, result: null, error: null, raw: null, ms: null };
 const LOADING: Panel<never> = { ...IDLE, loading: true };
+
+type CsUsage = { used: number; remaining: number };
+const csUsageOf = (b: CardSightResponse): CsUsage | null =>
+  typeof b.calls_this_month === "number" && typeof b.calls_remaining === "number"
+    ? { used: b.calls_this_month, remaining: b.calls_remaining }
+    : null;
+
+// Red when exhausted, amber when running low.
+const usageDot = (left: number | null, low: number) =>
+  left === 0 ? "bg-red-500" : left !== null && left <= low ? "bg-amber-400" : "bg-emerald-400";
 
 function cameraMessage(err: unknown) {
   switch (err instanceof DOMException ? err.name : "") {
@@ -60,7 +70,7 @@ export default function Home() {
   const [tcg, setTcg] = useState<Panel<CardResult>>(IDLE);
   const [cs, setCs] = useState<Panel<CardSightResult>>(IDLE);
   const [scans, setScans] = useState<number | null>(null);
-  const [calls, setCalls] = useState<number | null>(null);
+  const [csUsage, setCsUsage] = useState<CsUsage | null>(null);
   const scanning = tcg.loading || cs.loading;
   const hasOutput = !!(tcg.result || tcg.error || cs.result || cs.error);
 
@@ -99,7 +109,10 @@ export default function Home() {
       .catch(() => {});
     fetch("/api/cardsight")
       .then((r) => r.json() as Promise<CardSightResponse>)
-      .then((b) => typeof b.calls_this_month === "number" && setCalls(b.calls_this_month))
+      .then((b) => {
+        const u = csUsageOf(b);
+        if (u) setCsUsage(u);
+      })
       .catch(() => {});
   }, []);
 
@@ -140,7 +153,8 @@ export default function Home() {
         setTcg(settle(r));
       }),
       send<CardSightResponse>("/api/cardsight", form).then((r) => {
-        if (typeof r.body.calls_this_month === "number") setCalls(r.body.calls_this_month);
+        const u = csUsageOf(r.body);
+        if (u) setCsUsage(u);
         setCs(settle(r));
       }),
     ]);
@@ -161,13 +175,13 @@ export default function Home() {
           <p className="text-sm text-zinc-400">Compare TCGAPI and CardSight on the same photo</p>
         </div>
         <div className="flex flex-wrap gap-2">
+          <UsageBadge provider="TCGAPI" value={scans} unit="scans remaining" dot={usageDot(scans, 10)} />
           <UsageBadge
-            provider="TCGAPI"
-            value={scans}
-            unit="scans remaining"
-            dot={scans === 0 ? "bg-red-500" : scans !== null && scans <= 10 ? "bg-amber-400" : "bg-emerald-400"}
+            provider="CardSight"
+            value={csUsage?.remaining ?? null}
+            unit={`of ${CARDSIGHT_MONTHLY_LIMIT} calls remaining`}
+            dot={usageDot(csUsage?.remaining ?? null, CARDSIGHT_MONTHLY_LIMIT / 10)}
           />
-          <UsageBadge provider="CardSight" value={calls} unit="calls this month" dot="bg-sky-400" />
         </div>
       </header>
 
@@ -231,7 +245,7 @@ export default function Home() {
         <div ref={resultsRef} className="flex min-w-0 scroll-mt-4 flex-col gap-6">
           {scanning || hasOutput ? (
             <>
-              <Comparison tcg={tcg} cs={cs} scans={scans} calls={calls} />
+              <Comparison tcg={tcg} cs={cs} scans={scans} csUsage={csUsage} />
               <div className="grid items-start gap-6 md:grid-cols-2">
                 <FullResponse title="TCGAPI" panel={tcg} />
                 <FullResponse title="CardSight AI" panel={cs} />
@@ -258,12 +272,12 @@ function Comparison({
   tcg,
   cs,
   scans,
-  calls,
+  csUsage,
 }: {
   tcg: Panel<CardResult>;
   cs: Panel<CardSightResult>;
   scans: number | null;
-  calls: number | null;
+  csUsage: CsUsage | null;
 }) {
   const t = tcg.result;
   const c = cs.result;
@@ -309,7 +323,12 @@ function Comparison({
       c?.card.id,
     ],
     ["Response Time", seconds(tcg.ms), seconds(cs.ms)],
-    ["Usage After Scan", scans != null && `${scans} scans remaining`, calls != null && `${calls} calls this month`],
+    [
+      "Usage After Scan",
+      scans != null && `${scans} scans remaining`,
+      csUsage &&
+        `${csUsage.remaining} of ${CARDSIGHT_MONTHLY_LIMIT} calls remaining (${csUsage.used} used this month)`,
+    ],
   ];
 
   return (
