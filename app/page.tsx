@@ -7,9 +7,10 @@ import type { ApiResponse, CardResult } from "@/lib/tcgapi";
 const usd = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" });
 const MAX_EDGE = 1600; // px — plenty for recognition, keeps uploads well under Vercel's 4.5 MB body cap
 
-type Panel<T> = { loading: boolean; result: T | null; error: string | null };
-const IDLE: Panel<never> = { loading: false, result: null, error: null };
-const LOADING: Panel<never> = { loading: true, result: null, error: null };
+type Raw = Record<string, unknown>;
+type Panel<T> = { loading: boolean; result: T | null; error: string | null; raw: Raw | null; ms: number | null };
+const IDLE: Panel<never> = { loading: false, result: null, error: null, raw: null, ms: null };
+const LOADING: Panel<never> = { ...IDLE, loading: true };
 
 function cameraMessage(err: unknown) {
   switch (err instanceof DOMException ? err.name : "") {
@@ -27,20 +28,27 @@ function cameraMessage(err: unknown) {
   }
 }
 
-/** POSTs the photo; always resolves to a JSON body (network and parse failures become `error`). */
-async function send<T extends { error?: string }>(url: string, form: FormData): Promise<T> {
+/** POSTs the photo and times the round trip; always resolves (network/parse failures become `error`). */
+async function send<T extends { error?: string }>(url: string, form: FormData): Promise<{ body: T; ms: number }> {
+  const t0 = performance.now();
+  let body: T;
   try {
     const res = await fetch(url, { method: "POST", body: form });
-    return await res.json().catch(() => ({ error: `Server error (${res.status}). Try again.` }) as T);
+    body = await res.json().catch(() => ({ error: `Server error (${res.status}). Try again.` }) as T);
   } catch {
-    return { error: "Network error. Check your connection and try again." } as T;
+    body = { error: "Network error. Check your connection and try again." } as T;
   }
+  return { body, ms: performance.now() - t0 };
 }
 
-function settle<T>(body: { result?: T; error?: string }): Panel<T> {
-  return body.result
-    ? { loading: false, result: body.result, error: null }
-    : { loading: false, result: null, error: body.error ?? "Something went wrong. Try again." };
+function settle<T>({ body, ms }: { body: { result?: T; error?: string; raw?: Raw }; ms: number }): Panel<T> {
+  return {
+    loading: false,
+    result: body.result ?? null,
+    error: body.result ? null : (body.error ?? "Something went wrong. Try again."),
+    raw: body.raw ?? null,
+    ms,
+  };
 }
 
 export default function Home() {
@@ -95,9 +103,11 @@ export default function Home() {
       .catch(() => {});
   }, []);
 
-  // When results land below the camera (phones/tablets), bring them into view once per scan.
+  // Below the desktop breakpoint the results sit under the camera; bring them into view once per scan.
   useEffect(() => {
-    if (hasOutput) resultsRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    if (hasOutput && window.matchMedia("(max-width: 1023px)").matches) {
+      resultsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
   }, [hasOutput]);
 
   async function capture() {
@@ -123,15 +133,15 @@ export default function Home() {
 
     const form = new FormData();
     form.append("image", blob, "card.jpg");
-    // Same photo to both providers; each panel fills in as soon as its API answers.
+    // Same photo to both providers; each column fills in as soon as its API answers.
     await Promise.all([
-      send<ApiResponse>("/api/identify", form).then((b) => {
-        if (typeof b.scans_remaining === "number") setScans(b.scans_remaining);
-        setTcg(settle(b));
+      send<ApiResponse>("/api/identify", form).then((r) => {
+        if (typeof r.body.scans_remaining === "number") setScans(r.body.scans_remaining);
+        setTcg(settle(r));
       }),
-      send<CardSightResponse>("/api/cardsight", form).then((b) => {
-        if (typeof b.calls_this_month === "number") setCalls(b.calls_this_month);
-        setCs(settle(b));
+      send<CardSightResponse>("/api/cardsight", form).then((r) => {
+        if (typeof r.body.calls_this_month === "number") setCalls(r.body.calls_this_month);
+        setCs(settle(r));
       }),
     ]);
     video.play().catch(() => {});
@@ -161,7 +171,7 @@ export default function Home() {
         </div>
       </header>
 
-      <div className="grid items-start gap-6 lg:grid-cols-[minmax(0,1.1fr)_minmax(0,2fr)]">
+      <div className="grid items-start gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(0,2fr)]">
         <section className="mx-auto flex w-full max-w-xl flex-col gap-4 lg:sticky lg:top-6 lg:max-w-none">
           {/* Portrait on phones and in the narrow desktop column so a card fills the frame;
               capped height keeps Capture above the fold. */}
@@ -184,7 +194,7 @@ export default function Home() {
             {scanning && (
               <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-black/55">
                 <div className="absolute inset-x-0 h-0.5 animate-scan bg-emerald-400 shadow-[0_0_18px_4px_rgba(52,211,153,0.6)] motion-reduce:hidden" />
-                <div className="h-10 w-10 animate-spin rounded-full border-4 border-white/20 border-t-emerald-400" />
+                <Spinner className="h-10 w-10 border-4" />
                 <p className="text-sm font-medium">Identifying card…</p>
               </div>
             )}
@@ -218,18 +228,290 @@ export default function Home() {
           </button>
         </section>
 
-        <div ref={resultsRef} className="grid items-start gap-6 md:grid-cols-2">
-          <ProviderPanel name="TCGAPI" panel={tcg}>
-            {(r) => <TcgCard result={r} />}
-          </ProviderPanel>
-          <ProviderPanel name="CardSight AI" panel={cs}>
-            {(r) => <CardSightCard result={r} />}
-          </ProviderPanel>
+        <div ref={resultsRef} className="flex min-w-0 scroll-mt-4 flex-col gap-6">
+          {scanning || hasOutput ? (
+            <>
+              <Comparison tcg={tcg} cs={cs} scans={scans} calls={calls} />
+              <div className="grid items-start gap-6 md:grid-cols-2">
+                <FullResponse title="TCGAPI" panel={tcg} />
+                <FullResponse title="CardSight AI" panel={cs} />
+              </div>
+            </>
+          ) : (
+            <div className="rounded-2xl border border-dashed border-white/15 p-10 text-center text-sm text-zinc-400">
+              <p className="font-medium text-zinc-300">No card scanned yet</p>
+              <p className="mt-1">Hold a card inside the frame and press Capture. Both APIs are compared here.</p>
+            </div>
+          )}
         </div>
       </div>
     </main>
   );
 }
+
+/* ---------- comparison table ---------- */
+
+const date = (iso: string) => new Date(iso).toLocaleDateString();
+const seconds = (ms: number | null) => (ms == null ? null : `${(ms / 1000).toFixed(1)} s`);
+
+function Comparison({
+  tcg,
+  cs,
+  scans,
+  calls,
+}: {
+  tcg: Panel<CardResult>;
+  cs: Panel<CardSightResult>;
+  scans: number | null;
+  calls: number | null;
+}) {
+  const t = tcg.result;
+  const c = cs.result;
+  const rows: [string, ReactNode, ReactNode][] = [
+    ["Card Name", t?.card.name, c?.card.name],
+    ["Set", t?.card.set_name, c && [c.card.release, c.card.set].filter(Boolean).join(" › ")],
+    ["Set Code", t?.card.set_code, null],
+    ["Card Number", t?.card.number, c?.card.number],
+    ["Year", null, c?.card.year],
+    ["Manufacturer", null, c?.card.manufacturer],
+    ["Rarity", t?.card.rarity, null],
+    ["Variant", t?.card.printing, c && (c.card.parallel ?? "Base")],
+    ["Foil", t && <FoilPill on={t.card.is_foil} />, null],
+    ["Serial Numbered", null, c?.card.numbered_to ? `/${c.card.numbered_to}` : null],
+    [
+      "Graded Slab",
+      null,
+      c?.grading && [c.grading.company, c.grading.grade, c.grading.cert && `Cert ${c.grading.cert}`].filter(Boolean).join(" · "),
+    ],
+    [
+      "Price",
+      t && <Price value={t.market_data?.market_price} note="TCGplayer market price" />,
+      c && <Price value={c.pricing?.median} note={`Median of ${c.pricing?.sales ?? 0} eBay sales (raw, 90 days)`} />,
+    ],
+    ["Low Price", t?.market_data?.low_price != null ? usd.format(t.market_data.low_price) : null, null],
+    [
+      "Price Date",
+      t?.market_data?.updated_at && `Updated ${date(t.market_data.updated_at)}`,
+      c?.pricing?.last_sale && `Last sale ${date(c.pricing.last_sale)}`,
+    ],
+    [
+      "ID",
+      t?.card.tcgplayer_id && (
+        <a
+          href={`https://www.tcgplayer.com/product/${t.card.tcgplayer_id}`}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-sky-300 underline-offset-2 hover:underline"
+        >
+          TCGplayer {t.card.tcgplayer_id}
+        </a>
+      ),
+      c?.card.id,
+    ],
+    ["Response Time", seconds(tcg.ms), seconds(cs.ms)],
+    ["Usage After Scan", scans != null && `${scans} scans remaining`, calls != null && `${calls} calls this month`],
+  ];
+
+  return (
+    <div role="table" aria-label="TCGAPI and CardSight results compared" className="rounded-2xl bg-zinc-900 ring-1 ring-white/10">
+      {/* Sticky so the column names stay visible while scrolling the table on a phone. */}
+      <div role="row" className={`${GRID} sticky top-0 z-10 rounded-t-2xl border-b border-white/10 bg-zinc-900/95 py-3 backdrop-blur`}>
+        <div role="columnheader" className="hidden text-xs font-semibold uppercase tracking-wider text-zinc-500 sm:block">
+          Field
+        </div>
+        <div role="columnheader" className="text-sm font-semibold">TCGAPI</div>
+        <div role="columnheader" className="text-sm font-semibold">CardSight AI</div>
+      </div>
+
+      <CompareRow
+        label="Result"
+        a={<Status panel={tcg}>{t && <MatchBadge tone={t.match === "matched" ? "good" : "ok"}>{t.match === "matched" ? "Exact match" : "Best guess"}</MatchBadge>}</Status>}
+        b={<Status panel={cs}>{c && <MatchBadge tone={c.confidence === "High" ? "good" : c.confidence === "Medium" ? "ok" : "bad"}>{c.confidence} confidence</MatchBadge>}</Status>}
+      />
+      {t?.card.image_url && (
+        <CompareRow
+          label="Image"
+          // eslint-disable-next-line @next/next/no-img-element
+          a={<img src={t.card.image_url} alt={t.card.name} className="h-32 w-auto rounded-md ring-1 ring-white/10" />}
+          b={<Empty note="CardSight returns no image URL" />}
+        />
+      )}
+      {rows.map(([label, a, b]) => (
+        <CompareRow key={label} label={label} a={cell(tcg, a)} b={cell(cs, b)} />
+      ))}
+    </div>
+  );
+}
+
+// Mobile: field name spans the row, the two values sit side by side under it. sm+: classic 3-column table.
+const GRID = "grid grid-cols-2 gap-x-4 gap-y-1 px-4 sm:grid-cols-[minmax(0,0.8fr)_minmax(0,1fr)_minmax(0,1fr)] sm:px-5";
+
+function CompareRow({ label, a, b }: { label: string; a: ReactNode; b: ReactNode }) {
+  return (
+    <div role="row" className={`${GRID} border-b border-white/5 py-3 last:rounded-b-2xl last:border-0`}>
+      <div
+        role="rowheader"
+        className="col-span-2 text-xs font-medium uppercase tracking-wider text-zinc-500 sm:col-span-1 sm:text-sm sm:normal-case sm:tracking-normal sm:text-zinc-400"
+      >
+        {label}
+      </div>
+      <div role="cell" className="min-w-0 text-sm font-medium [overflow-wrap:anywhere]">{a}</div>
+      <div role="cell" className="min-w-0 text-sm font-medium [overflow-wrap:anywhere]">{b}</div>
+    </div>
+  );
+}
+
+function cell(panel: Panel<unknown>, value: ReactNode) {
+  if (panel.loading) return <span className="block h-4 w-2/3 animate-pulse rounded bg-white/10" aria-label="Loading" />;
+  return value === null || value === undefined || value === "" || value === false ? <Empty /> : value;
+}
+
+function Status({ panel, children }: { panel: Panel<unknown>; children: ReactNode }) {
+  if (panel.loading) {
+    return (
+      <span className="inline-flex items-center gap-2 text-zinc-400">
+        <Spinner className="h-4 w-4 border-2" /> Identifying…
+      </span>
+    );
+  }
+  if (panel.error) return <span role="alert" className="text-red-300">{panel.error}</span>;
+  return children;
+}
+
+const Empty = ({ note }: { note?: string }) => (
+  <span className="text-zinc-600">
+    —{note && <span className="ml-1 text-xs font-normal">{note}</span>}
+  </span>
+);
+
+const Price = ({ value, note }: { value: number | null | undefined; note: string }) => (
+  <span className="flex flex-col">
+    <span className="text-lg font-semibold text-emerald-300">{value != null ? usd.format(value) : "—"}</span>
+    <span className="text-xs font-normal text-zinc-500">{note}</span>
+  </span>
+);
+
+const FoilPill = ({ on }: { on: boolean }) => (
+  <span
+    className={`rounded-full px-2 py-0.5 text-xs font-medium ${
+      on ? "bg-gradient-to-r from-fuchsia-500/25 to-sky-500/25 text-sky-200" : "bg-white/10 text-zinc-300"
+    }`}
+  >
+    {on ? "True" : "False"}
+  </span>
+);
+
+/* ---------- full response (every field each API returned) ---------- */
+
+const humanize = (key: string) =>
+  key
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/[_-]+/g, " ")
+    .replace(/^\w/, (ch) => ch.toUpperCase());
+
+// Scalars and arrays of scalars render as one row; objects and arrays of objects nest.
+const isLeaf = (v: unknown): boolean =>
+  v === null || typeof v !== "object" || (Array.isArray(v) && v.every((x) => x === null || typeof x !== "object"));
+
+function FullResponse({ title, panel }: { title: string; panel: Panel<unknown> }) {
+  const entries = panel.raw ? Object.entries(panel.raw) : [];
+  const scalars = entries.filter(([, v]) => isLeaf(v));
+  const groups = entries.filter(([, v]) => !isLeaf(v));
+  return (
+    <section aria-busy={panel.loading} className="min-w-0 rounded-2xl bg-zinc-900 ring-1 ring-white/10">
+      <h2 className="border-b border-white/10 px-5 py-4 text-sm font-semibold">
+        {title} <span className="font-normal text-zinc-500">· full response</span>
+      </h2>
+      {panel.loading ? (
+        <p className="flex items-center gap-2 p-5 text-sm text-zinc-400">
+          <Spinner className="h-4 w-4 border-2" /> Identifying…
+        </p>
+      ) : !panel.raw ? (
+        <p className="p-5 text-sm text-zinc-500">{panel.error ?? "No data returned."}</p>
+      ) : (
+        <>
+          {scalars.length > 0 && (
+            <dl className="divide-y divide-white/5 px-5 py-2">
+              {scalars.map(([k, v]) => (
+                <Row key={k} label={humanize(k)}>
+                  <Leaf name={k} value={v} />
+                </Row>
+              ))}
+            </dl>
+          )}
+          {groups.map(([k, v]) => (
+            <details key={k} open className="border-t border-white/10">
+              <summary className="cursor-pointer select-none px-5 py-3 text-xs font-semibold uppercase tracking-wider text-zinc-400 hover:text-zinc-200">
+                {humanize(k)}
+              </summary>
+              <div className="px-5 pb-4">
+                <Tree value={v} />
+              </div>
+            </details>
+          ))}
+        </>
+      )}
+    </section>
+  );
+}
+
+function Tree({ value }: { value: unknown }): ReactNode {
+  if (isLeaf(value)) return <Leaf name="" value={value} />;
+  if (Array.isArray(value)) {
+    return (
+      <div className="flex flex-col gap-3">
+        {value.map((item, i) => (
+          <div key={i} className="rounded-lg bg-white/[0.03] p-3 ring-1 ring-white/5">
+            <p className="mb-1 text-xs font-semibold text-zinc-500">#{i + 1}</p>
+            <Tree value={item} />
+          </div>
+        ))}
+      </div>
+    );
+  }
+  return (
+    <dl className="divide-y divide-white/5">
+      {Object.entries(value as Raw).map(([k, v]) =>
+        isLeaf(v) ? (
+          <Row key={k} label={humanize(k)}>
+            <Leaf name={k} value={v} />
+          </Row>
+        ) : (
+          <div key={k} className="py-2">
+            <dt className="mb-2 text-sm text-zinc-400">{humanize(k)}</dt>
+            <dd className="border-l border-white/10 pl-3">
+              <Tree value={v} />
+            </dd>
+          </div>
+        ),
+      )}
+    </dl>
+  );
+}
+
+function Leaf({ name, value }: { name: string; value: unknown }) {
+  if (value === null || value === undefined || value === "" || (Array.isArray(value) && !value.length)) return <Empty />;
+  if (Array.isArray(value)) return <>{value.join(", ")}</>;
+  if (typeof value === "boolean") return <>{value ? "Yes" : "No"}</>;
+  if (typeof value === "string" && /^https?:\/\//.test(value)) {
+    const link = (
+      <a href={value} target="_blank" rel="noopener noreferrer" className="text-sky-300 underline-offset-2 hover:underline">
+        {value}
+      </a>
+    );
+    if (!/image/i.test(name)) return link;
+    return (
+      <span className="flex flex-col items-end gap-1">
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img src={value} alt="" className="h-24 w-auto rounded ring-1 ring-white/10" />
+        {link}
+      </span>
+    );
+  }
+  return <>{String(value)}</>;
+}
+
+/* ---------- small shared bits ---------- */
 
 function UsageBadge({ provider, value, unit, dot }: { provider: string; value: number | null; unit: string; dot: string }) {
   return (
@@ -242,31 +524,6 @@ function UsageBadge({ provider, value, unit, dot }: { provider: string; value: n
   );
 }
 
-function ProviderPanel<T>({ name, panel, children }: { name: string; panel: Panel<T>; children: (result: T) => ReactNode }) {
-  return (
-    <section aria-live="polite" aria-busy={panel.loading} className="flex min-w-0 flex-col gap-3">
-      <h2 className="text-sm font-semibold uppercase tracking-wider text-zinc-400">{name}</h2>
-      {panel.loading ? (
-        <div className="flex items-center justify-center gap-3 rounded-2xl bg-zinc-900 p-10 text-sm text-zinc-400 ring-1 ring-white/10">
-          <div className="h-5 w-5 animate-spin rounded-full border-2 border-white/20 border-t-emerald-400" />
-          Identifying…
-        </div>
-      ) : panel.error ? (
-        <div role="alert" className="rounded-2xl bg-red-500/10 p-6 ring-1 ring-red-500/30">
-          <h3 className="font-semibold text-red-300">Scan failed</h3>
-          <p className="mt-1 text-sm text-red-200/80">{panel.error}</p>
-        </div>
-      ) : panel.result ? (
-        children(panel.result)
-      ) : (
-        <div className="rounded-2xl border border-dashed border-white/15 p-10 text-center text-sm text-zinc-400">
-          Hold a card inside the frame and press Capture.
-        </div>
-      )}
-    </section>
-  );
-}
-
 function MatchBadge({ tone, children }: { tone: "good" | "ok" | "bad"; children: ReactNode }) {
   const color = {
     good: "bg-emerald-500/15 text-emerald-300",
@@ -276,135 +533,15 @@ function MatchBadge({ tone, children }: { tone: "good" | "ok" | "bad"; children:
   return <span className={`inline-block rounded-full px-2 py-0.5 text-xs font-medium ${color}`}>{children}</span>;
 }
 
-function CardName({ name }: { name: string }) {
-  return (
-    <>
-      <p className="mt-2 text-xs uppercase tracking-wider text-zinc-500">Card Name</p>
-      <h3 className="text-2xl font-semibold leading-tight break-words">{name}</h3>
-    </>
-  );
-}
-
-const Price = ({ value }: { value: number | null | undefined }) => (
-  <span className="text-lg font-semibold text-emerald-300">{value != null ? usd.format(value) : "—"}</span>
+const Spinner = ({ className }: { className: string }) => (
+  <span className={`inline-block shrink-0 animate-spin rounded-full border-white/20 border-t-emerald-400 ${className}`} aria-hidden />
 );
-
-function TcgCard({ result: { match, card, market_data } }: { result: CardResult }) {
-  return (
-    <article className="overflow-hidden rounded-2xl bg-zinc-900 ring-1 ring-white/10">
-      <header className="flex gap-4 border-b border-white/10 p-5">
-        {card.image_url && (
-          // eslint-disable-next-line @next/next/no-img-element
-          <img src={card.image_url} alt={card.name} className="h-28 w-20 shrink-0 rounded-md object-cover ring-1 ring-white/10" />
-        )}
-        <div className="min-w-0">
-          <MatchBadge tone={match === "matched" ? "good" : "ok"}>{match === "matched" ? "Exact match" : "Best guess"}</MatchBadge>
-          <CardName name={card.name} />
-        </div>
-      </header>
-
-      <Section title="Card Details">
-        <Row label="Set Name">{card.set_name ?? "—"}</Row>
-        <Row label="Set Code">{card.set_code ?? "—"}</Row>
-        <Row label="Collector Number">{card.number ?? "—"}</Row>
-        <Row label="Rarity">{card.rarity ?? "—"}</Row>
-        <Row label="Foil">
-          <span
-            className={`rounded-full px-2 py-0.5 text-xs font-medium ${
-              card.is_foil ? "bg-gradient-to-r from-fuchsia-500/25 to-sky-500/25 text-sky-200" : "bg-white/10 text-zinc-300"
-            }`}
-          >
-            {card.is_foil ? "True" : "False"}
-          </span>
-          {card.printing && <span className="ml-2 text-zinc-500">{card.printing}</span>}
-        </Row>
-      </Section>
-
-      <Section title="TCGplayer">
-        <Row label="Market Price">
-          <Price value={market_data?.market_price} />
-        </Row>
-        <Row label="TCGplayer ID">
-          {card.tcgplayer_id ? (
-            <a
-              href={`https://www.tcgplayer.com/product/${card.tcgplayer_id}`}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-sky-300 underline-offset-2 hover:underline"
-            >
-              {card.tcgplayer_id}
-            </a>
-          ) : (
-            "—"
-          )}
-        </Row>
-        {market_data?.updated_at && (
-          <Row label="Price Updated">
-            <span className="text-zinc-400">{new Date(market_data.updated_at).toLocaleDateString()}</span>
-          </Row>
-        )}
-      </Section>
-    </article>
-  );
-}
-
-function CardSightCard({ result: { confidence, card, grading, pricing } }: { result: CardSightResult }) {
-  return (
-    <article className="overflow-hidden rounded-2xl bg-zinc-900 ring-1 ring-white/10">
-      <header className="border-b border-white/10 p-5">
-        <MatchBadge tone={confidence === "High" ? "good" : confidence === "Medium" ? "ok" : "bad"}>
-          {confidence} confidence
-        </MatchBadge>
-        <CardName name={card.name} />
-      </header>
-
-      <Section title="Card Details">
-        <Row label="Year">{card.year ?? "—"}</Row>
-        <Row label="Manufacturer">{card.manufacturer ?? "—"}</Row>
-        <Row label="Release">{card.release ?? "—"}</Row>
-        <Row label="Set">{card.set ?? "—"}</Row>
-        <Row label="Card Number">{card.number ?? "—"}</Row>
-        <Row label="Parallel">{card.parallel ?? "Base"}</Row>
-        {card.numbered_to ? <Row label="Serial Numbered">/{card.numbered_to}</Row> : null}
-      </Section>
-
-      {grading && (
-        <Section title="Graded Slab">
-          <Row label="Company">{grading.company}</Row>
-          <Row label="Grade">{grading.grade ?? "—"}</Row>
-          <Row label="Cert Number">{grading.cert ?? "—"}</Row>
-        </Section>
-      )}
-
-      <Section title="eBay Sold · Raw · Last 90 Days">
-        <Row label="Median Price">
-          <Price value={pricing?.median} />
-        </Row>
-        <Row label="Sales">{pricing ? pricing.sales : "—"}</Row>
-        {pricing?.last_sale && (
-          <Row label="Last Sale">
-            <span className="text-zinc-400">{new Date(pricing.last_sale).toLocaleDateString()}</span>
-          </Row>
-        )}
-      </Section>
-    </article>
-  );
-}
-
-function Section({ title, children }: { title: string; children: ReactNode }) {
-  return (
-    <div className="border-b border-white/10 px-5 py-4 last:border-0">
-      <h4 className="mb-2 text-xs font-semibold uppercase tracking-wider text-zinc-500">{title}</h4>
-      <dl className="divide-y divide-white/5">{children}</dl>
-    </div>
-  );
-}
 
 function Row({ label, children }: { label: string; children: ReactNode }) {
   return (
-    <div className="flex items-center justify-between gap-4 py-2 text-sm">
+    <div className="flex items-start justify-between gap-4 py-2 text-sm">
       <dt className="shrink-0 text-zinc-400">{label}</dt>
-      <dd className="min-w-0 text-right font-medium break-words">{children}</dd>
+      <dd className="min-w-0 text-right font-medium [overflow-wrap:anywhere]">{children}</dd>
     </div>
   );
 }

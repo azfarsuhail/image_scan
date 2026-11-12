@@ -74,8 +74,9 @@ export async function POST(req: Request) {
   // The scan is charged on any 200, so refresh the balance whether or not the card was recognized.
   const scans_remaining = (await getUsage(key)) ?? body.meta?.scans_remaining ?? null;
   const result = toResult(body.data);
+  const raw = { ...body.data, meta: body.meta }; // full payload for the "full response" panel
 
   return typeof result === "string"
-    ? Response.json({ error: result, scans_remaining }, { status: 422 })
-    : Response.json({ result, scans_remaining });
+    ? Response.json({ error: result, scans_remaining, raw }, { status: 422 })
+    : Response.json({ result, scans_remaining, raw });
 }

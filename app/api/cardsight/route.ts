@@ -74,7 +74,10 @@ export async function POST(req: Request) {
 
   const result = toCardSight(body);
   if (typeof result === "string") {
-    return Response.json({ error: result, calls_this_month: await callsThisMonth(key) }, { status: 422 });
+    return Response.json(
+      { error: result, calls_this_month: await callsThisMonth(key), raw: body },
+      { status: 422 },
+    );
   }
 
   // Ungraded completed auctions from the last 90 days, for the suggested parallel (or the base card).
@@ -89,5 +92,6 @@ export async function POST(req: Request) {
   return Response.json({
     result: { ...result, pricing: pricing && summarizePricing(pricing) },
     calls_this_month: await callsThisMonth(key),
+    raw: { ...body, pricing }, // full payloads for the "full response" panel
   });
 }

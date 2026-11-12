@@ -50,6 +50,7 @@ export type CardSightResponse = {
   result?: CardSightResult;
   error?: string;
   calls_this_month?: number | null;
+  raw?: Record<string, unknown>; // complete identify (+ pricing) payload, shown untruncated in the UI
 };
 
 /** Maps the first identified card in CardSight's payload, or returns a user-facing error string. */

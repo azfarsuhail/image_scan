@@ -49,6 +49,7 @@ export type ApiResponse = {
   result?: CardResult;
   error?: string;
   scans_remaining?: number | null;
+  raw?: Record<string, unknown>; // complete TCGAPI payload, shown untruncated in the UI
 };
 
 const NOT_RECOGNIZED: Record<string, string> = {
